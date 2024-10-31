@@ -18,6 +18,7 @@ import logging
 from typing import List, Tuple, Dict, Optional
 from openai import AsyncOpenAI
 import asyncio
+from collections import defaultdict
 
 
 # Set up logging
@@ -317,100 +318,120 @@ class ChatResponse(BaseModel):
 
 def get_system_message(search_type: str) -> str:
     """
-    Enhanced system message with stronger emphasis on patent content analysis.
+    Get system message based on search type with proper error handling.
     """
-    base_message = """You are a highly experienced patent lawyer specializing in patent analysis. Your task is to:
-
-1. Carefully analyze the provided patent content
-2. Draw direct connections between the patent content and the user's query
-3. Quote relevant sections from the patent to support your analysis
-4. Identify specific technical elements that are relevant to the search type
-5. Maintain strict focus on the actual content provided, avoiding general statements
-6. Format your response with clear sections and specific evidence
-
-Remember:
-- Always support your analysis with direct quotes from the patent
-- Focus on technical details and specific implementations
-- Identify both similarities and differences to the user's query
-- Consider the context of the search type in your analysis"""
-
-    if search_type == "patentability":
-        base_message += """
-For patentability analysis:
-- Focus on identifying specific technical elements that could impact novelty
-- Highlight any teaching of similar solutions or approaches
-- Note any specific parameters, materials, or methods that overlap with the query
-- Consider combinations of elements that might affect non-obviousness"""
+    try:
+        base_messages = {
+            "patentability": """You are an AI assistant specializing in patentability analysis. 
+            Focus on identifying relevant prior art and analyzing its implications for patentability.""",
+            
+            "infringement": """You are an AI assistant specializing in patent infringement analysis. 
+            Focus on identifying potential infringement issues and analyzing claim coverage.""",
+            
+            "validity": """You are an AI assistant specializing in patent validity analysis. 
+            Focus on analyzing the validity of patent claims and identifying potential invalidity arguments.""",
+            
+            "general": """You are an AI assistant specializing in patent analysis. 
+            Provide comprehensive analysis of patent content and its implications."""
+        }
+        
+        return base_messages.get(search_type.lower(), base_messages["general"])
     
-    return base_message
+    except Exception as e:
+        logger.error(f"Error in get_system_message: {str(e)}")
+        return """You are an AI assistant specializing in patent analysis. 
+        Provide detailed, accurate analysis of patent content while maintaining proper citations and references."""
+    
 
 
 def create_single_patent_prompt(user_query: str, patent: Dict, search_type: str) -> str:
     """
-    Create a more structured prompt that ensures the patent content is properly analyzed.
+    Creates a prompt with proper string handling and initialization.
     """
-    try:
-        patent_info = {
-            'patent_id': patent.get('patent_id', 'Unknown'),
-            'is_claims': patent.get('is_claims', False),
-            'is_abstract': patent.get('is_abstract', False),
-            'is_patentability': search_type == "patentability",
-            'text': patent.get('text', '').strip()  # Ensure text is cleaned
-        }
-        
-        prompt = f"""
-        Analyze this patent content in relation to the following user query:
-        
-        USER QUERY: {user_query}
-        
-        PATENT DETAILS:
-        - Patent ID: {patent_info['patent_id']}
-        - Section Type: {"Claims" if patent_info['is_claims'] else "Description"}
-        - Search Context: {search_type.upper()} Analysis
-        
-        RELEVANT PATENT CONTENT:
-        ```
-        {patent_info['text']}
-        ```
-        
-        Please provide a detailed analysis that:
-        1. Specifically references the relevant portions of the patent content above
-        2. Explains how these portions relate to the user's query
-        3. Identifies any specific technical overlaps or differences
-        4. Assesses the relevance for {search_type} purposes
-        
-        Format your response with clear section headers and specific quotes from the patent when relevant.
-        """
-        return prompt.strip()
-    except Exception as e:
-        logger.error(f"Error creating prompt: {str(e)}")
-        return f"Error creating prompt: {str(e)}"
+    # Initialize base prompt with f-string
+    base_prompt = f"""
+Analyze the following patent in relation to this query: "{user_query}"
+
+Patent ID: {patent['patent_id']}
+Available Pages: {patent['chunk_indices']}
+
+Content by page:"""
+    
+    # Build page-specific content sections using list comprehension and join
+    page_contents = []
+    for chunk in patent['chunks']:
+        chunk_text = chunk.get('text', '').strip()
+        if chunk_text:  # Only add non-empty chunks
+            page_contents.append(f"\nPAGE {chunk.get('chunk_index')}:\n{chunk_text}")
+    
+    # Join all content parts
+    full_prompt = base_prompt + ''.join(page_contents)
+    
+    # Add analysis instructions
+    analysis_instructions = """
+
+Please provide a detailed analysis that:
+1. References specific pages when discussing content
+2. Uses direct quotes with page numbers to support key points
+3. Makes connections between content from different pages when relevant
+4. Uses the format "On page X: [finding/content]" when referencing specific sections
+
+Focus on how this patent relates to the query, highlighting the most relevant sections with page references.
+"""
+    
+    return full_prompt + analysis_instructions
     
 
 async def run_analysis_sync(message: str, results: List[dict], search_type: str) -> List[Tuple[str, List[dict]]]:
     """
     Generate analysis with references for each section using OpenAI.
+    First combines chunks from the same patent before analysis.
     """
     try:
-        logger.info(f"Starting analysis with {len(results)} results")
+        # Log initial results details
+        unique_patents = len({r['patent_id'] for r in results[:5]})
+        unique_chunks = len([(r['patent_id'], r['chunk_index']) for r in results[:5]])
+        logger.info(f"Initial results stats:")
+        logger.info(f"Total results in top 5: {len(results[:5])}")
+        logger.info(f"Unique patent IDs: {unique_patents}")
+        logger.info(f"Unique patent chunks: {unique_chunks}")
         
+        # Print detailed breakdown
+        patent_chunk_mapping = defaultdict(list)
+        for r in results[:5]:
+            patent_chunk_mapping[r['patent_id']].append(r['chunk_index'])
+        
+        logger.info("Detailed patent-chunk breakdown:")
+        for patent_id, chunks in patent_chunk_mapping.items():
+            logger.info(f"Patent {patent_id}: {len(chunks)} chunks - Indices: {chunks}")
+
         if not results:
             return [("No relevant documents were found for your query.", [])]
 
         # Initialize OpenAI client
         client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         
+        # Preprocess and combine chunks from same patent
+        combined_results = combine_patent_chunks(results[:5])
+        
+        # Log combined results details
+        logger.info(f"\nAfter combining chunks:")
+        logger.info(f"Number of unique patents for analysis: {len(combined_results)}")
+        for patent in combined_results:
+            logger.info(f"Patent {patent['patent_id']}: Combined {len(patent['chunks'])} chunks - "
+                       f"Indices: {patent['chunk_indices']} - Score: {patent['final_score']:.3f}")
+        
         # Analyze patents
         analyses = await asyncio.gather(*[
-            analyze_single_patent_async(message, result, search_type, client)
-            for result in results[:5]  # Limit to top 5 results
+            analyze_single_patent_async(message, patent_data, search_type, client)
+            for patent_data in combined_results
         ])
         
         # Format the analyses
         formatted_analyses = []
-        for analysis, result in zip(analyses, results[:5]):
+        for analysis, patent_data in zip(analyses, combined_results):
             if analysis:  # Only include successful analyses
-                formatted_analyses.append((analysis, [result]))
+                formatted_analyses.append((analysis, patent_data['chunks']))
         
         # Add overall conclusion
         if formatted_analyses:
@@ -418,57 +439,154 @@ async def run_analysis_sync(message: str, results: List[dict], search_type: str)
             conclusion += analyze_conclusion(message, results[:5])
             formatted_analyses.append((conclusion, results[:5]))
         
-        logger.info(f"Analysis complete. Generated {len(formatted_analyses)} sections")
+        logger.info(f"\nAnalysis complete. Generated {len(formatted_analyses)} sections")
         return formatted_analyses
 
     except Exception as e:
         logger.error(f"Error in analysis: {str(e)}")
         return [("An error occurred during analysis.", [])]
+    
+
+def combine_patent_chunks(results: List[dict]) -> List[dict]:
+    """
+    Combines chunks with proper string handling and initialization.
+    """
+    # Group chunks by patent_id
+    patent_groups = defaultdict(list)
+    for result in results:
+        if result.get('patent_id'):  # Only process results with valid patent_id
+            patent_groups[result['patent_id']].append(result)
+    
+    combined_results = []
+    for patent_id, chunks in patent_groups.items():
+        try:
+            # Sort chunks by chunk_index (page number)
+            sorted_chunks = sorted(chunks, key=lambda x: x.get('chunk_index', 0))
+            
+            # Log combining process
+            logger.info(f"\nCombining pages for patent {patent_id}:")
+            logger.info(f"Found {len(chunks)} pages with numbers: {[chunk.get('chunk_index') for chunk in sorted_chunks]}")
+            
+            # Build combined text with proper string handling
+            combined_text_parts = []
+            for chunk in sorted_chunks:
+                chunk_text = chunk.get('text', '').strip()
+                if chunk_text:  # Only add non-empty chunks
+                    combined_text_parts.append(f"PAGE {chunk.get('chunk_index')}:\n{chunk_text}")
+            
+            # Create combined patent entry
+            combined_patent = {
+                'patent_id': patent_id,
+                'text': '\n\n'.join(combined_text_parts),
+                'final_score': max((chunk.get('final_score', 0) for chunk in sorted_chunks), default=0),
+                'chunks': sorted_chunks,
+                'chunk_indices': [chunk.get('chunk_index') for chunk in sorted_chunks]
+            }
+            
+            logger.info(f"Combined {len(chunks)} pages of content")
+            logger.info(f"Using highest score: {combined_patent['final_score']:.3f}")
+            
+            combined_results.append(combined_patent)
+            
+        except Exception as e:
+            logger.error(f"Error combining chunks for patent {patent_id}: {str(e)}")
+            logger.error("Error details:", exc_info=True)
+            continue
+    
+    # Sort combined results by max score
+    combined_results.sort(key=lambda x: x['final_score'], reverse=True)
+    
+    return combined_results
 
 async def analyze_single_patent_async(user_query: str, patent: Dict, search_type: str, client: AsyncOpenAI) -> str:
     """
-    Enhanced analysis function with better context handling and error checking.
+    Enhanced analysis function with Markdown formatting for better frontend display.
     """
     try:
+        logger.info(f"\nAnalyzing patent {patent['patent_id']}:")
+        logger.info(f"Analyzing content from pages: {patent['chunk_indices']}")
+        
         # Validate patent content
         if not patent.get('text', '').strip():
             logger.warning(f"Empty or invalid patent content for {patent.get('patent_id', 'unknown')}")
             return f"Unable to analyze Patent {patent.get('patent_id', 'unknown')} - Invalid content"
 
+        # Create page reference section with Markdown formatting
+        page_references = []
+        for chunk in patent['chunks']:
+            chunk_text = chunk.get('text', '').strip()
+            if chunk_text:
+                preview_text = chunk_text[:50]
+                if len(chunk_text) > 50:
+                    last_space = preview_text.rfind(' ')
+                    if last_space > 0:
+                        preview_text = preview_text[:last_space]
+                    preview_text += "..."
+                
+                page_references.append(f"* **Page {chunk.get('chunk_index', 'unknown')}**:\n  > {preview_text}")
+
+        # Format page references with proper Markdown
+        page_references_text = "\n".join(page_references)
+
+        # Get base system message with fallback
+        base_system_message = get_system_message(search_type)
+        if base_system_message is None:
+            base_system_message = """You are an AI assistant specializing in patent analysis. 
+            Provide detailed, accurate analysis of patent content while maintaining proper citations and references."""
+
+        # Create complete system message
+        system_message = f"""{base_system_message}
+
+IMPORTANT: Your analysis must:
+1. Reference specific page numbers when quoting or referring to content
+2. Use the format 'On page X: [content/finding]' when discussing specific sections
+3. Provide direct quotes with page references to support key points
+4. Make clear connections between different pages when relevant
+5. Focus on the most relevant sections that address the query
+6. Use markdown formatting for emphasis and structure when appropriate
+"""
+
         prompt = create_single_patent_prompt(user_query, patent, search_type)
-        system_message = get_system_message(search_type)
-
-        # Add specific instructions for content analysis
-        system_message += "\nIMPORTANT: Your analysis must directly reference and quote the provided patent content. Do not make general statements without supporting evidence from the text."
-
-        # Use GPT-4 with increased max tokens to ensure thorough analysis
+        
+        logger.info(f"Sending request to OpenAI for patent {patent['patent_id']}")
         response = await client.chat.completions.create(
             model="gpt-4-turbo",
             messages=[
                 {"role": "system", "content": system_message},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.5,  # Lower temperature for more focused analysis
-            max_tokens=2000,  # Increased token limit for thorough analysis
-            presence_penalty=0.6,  # Encourage reference to different parts of the text
-            frequency_penalty=0.3  # Reduce repetition
+            temperature=0.5,
+            max_tokens=2000,
+            presence_penalty=0.6,
+            frequency_penalty=0.3
         )
         
         analysis = response.choices[0].message.content
+        logger.info(f"Successfully received analysis for patent {patent['patent_id']}")
 
-        # Format the response with clear structure
+        # Create formatted response with Markdown
         formatted_response = f"""
-        ### Analysis for Patent {patent['patent_id']} ({search_type.upper()} Analysis) ###
+# Patent Analysis: {patent['patent_id']} ({search_type.upper()})
 
-        {analysis}
+## 📄 Referenced Pages
+{page_references_text}
 
-        -------------------
-        """
+---
+
+## 📋 Detailed Analysis
+{analysis}
+
+---
+"""
+
         return formatted_response.strip()
     
     except Exception as e:
         logger.error(f"Error analyzing patent: {str(e)}")
+        logger.error("Error details:", exc_info=True)
         return f"Error analyzing patent {patent.get('patent_id', 'unknown')}: {str(e)}"
+    
+    
 
 def analyze_conclusion(message: str, refs: List[dict]) -> str:
     """
@@ -784,7 +902,7 @@ def rerank_search_results(bm25_results, semantic_results, alpha=0.7, top_k=None)
     if normalized_bm25 and normalized_semantic:
         for result in combined_results.values():
             result['final_score'] = (alpha * result['bm25_score']) + ((1 - alpha) * result['semantic_score'])
-            
+
     reranked_results = sorted(combined_results.values(), key=lambda x: x['final_score'], reverse=True)
     if top_k:
         reranked_results = reranked_results[:top_k]
