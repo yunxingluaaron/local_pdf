@@ -458,12 +458,12 @@ async def analyze_single_patent_async(user_query: str, patent: Dict, search_type
 
         # Format the response with clear structure
         formatted_response = f"""
-### Analysis for Patent {patent['patent_id']} ({search_type.upper()} Analysis) ###
+        ### Analysis for Patent {patent['patent_id']} ({search_type.upper()} Analysis) ###
 
-{analysis}
+        {analysis}
 
--------------------
-"""
+        -------------------
+        """
         return formatted_response.strip()
     
     except Exception as e:
@@ -760,9 +760,11 @@ def rerank_search_results(bm25_results, semantic_results, alpha=0.7, top_k=None)
         return normalized_semantic if not top_k else normalized_semantic[:top_k]
     
     normalized_bm25 = normalize_scores(bm25_results)
+
     normalized_semantic = normalize_scores(semantic_results)
     
     combined_results = {}
+
     for result in normalized_bm25 + normalized_semantic:
         key = (result['patent_id'], result['chunk_index'])
         if key not in combined_results:
@@ -778,16 +780,15 @@ def rerank_search_results(bm25_results, semantic_results, alpha=0.7, top_k=None)
             # When only semantic results exist, use semantic score directly
             if not normalized_bm25:
                 combined_results[key]['final_score'] = result['normalized_score']
-    
-    # Calculate combined scores only when both types exist
+
     if normalized_bm25 and normalized_semantic:
         for result in combined_results.values():
             result['final_score'] = (alpha * result['bm25_score']) + ((1 - alpha) * result['semantic_score'])
-    
+            
     reranked_results = sorted(combined_results.values(), key=lambda x: x['final_score'], reverse=True)
     if top_k:
         reranked_results = reranked_results[:top_k]
-    
+
     logger.info(f"Reranking complete. Returning {len(reranked_results)} results")
     return reranked_results
 
