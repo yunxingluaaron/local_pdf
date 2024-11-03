@@ -15,7 +15,7 @@ function App() {
     <Container maxWidth="xl">
       <Box sx={{ my: 4 }}>
         <Typography variant="h4" component="h1" gutterBottom align="center">
-          PDF Chat Assistant
+          VineAI - Your Local IP documents Prior Art Search Expert
         </Typography>
         
         <PDFUploadComponent onUploadComplete={handleUploadComplete} />

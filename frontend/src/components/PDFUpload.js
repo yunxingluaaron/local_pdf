@@ -132,7 +132,7 @@ const PDFUploadComponent = ({ onUploadComplete }) => {
   return (
     <Paper sx={{ p: 3, maxWidth: 800, margin: 'auto', mt: 3 }}>
       <Typography variant="h5" gutterBottom>
-        Upload PDFs for Analysis
+        Please Upload PDFs for Analysis
       </Typography>
       
       <Box sx={{ mb: 3 }}>

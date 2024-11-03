@@ -297,7 +297,7 @@ const ChatInterfaceComponent = ({ pdfFiles }) => {
             </Box>
           )}
         </Box>
-        
+{/*         
         {message.sender === 'bot' && message.sources && message.sources.length > 0 && (
           <Box sx={{ mt: 1, display: 'flex', flexWrap: 'wrap', gap: 1 }}>
             {message.sources.map((source, idx) => {
@@ -319,7 +319,7 @@ const ChatInterfaceComponent = ({ pdfFiles }) => {
               );
             })}
           </Box>
-        )}
+        )} */}
       </Paper>
     );
   };

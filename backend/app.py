@@ -19,6 +19,7 @@ from typing import List, Tuple, Dict, Optional
 from openai import AsyncOpenAI
 import asyncio
 from collections import defaultdict
+from io import BytesIO
 
 
 # Set up logging
@@ -43,8 +44,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount the uploads directory for serving PDF files
-app.mount("/pdf", StaticFiles(directory=UPLOAD_DIR), name="pdf")
 
 # Initialize OpenAI client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -137,30 +136,6 @@ def create_es_mapping(index_name: str):
         raise
 
 
-
-def extract_text_from_pdf(file_path: str, filename: str) -> List[Dict]:
-    """Extract text from PDF file page by page."""
-    pages = []
-    try:
-        with open(file_path, 'rb') as file:
-            reader = PdfReader(file)
-            for page_num in range(len(reader.pages)):
-                text = reader.pages[page_num].extract_text()
-                if text.strip():
-                    pages.append({
-                        "pdf_name": filename,
-                        "chunk_index": page_num,
-                        "text": text,
-                        "is_claims": False,
-                        "is_abstract": False,
-                        "is_patentability": True,
-                        "is_fto": False
-                    })
-        return pages
-    except Exception as e:
-        print(f"Error extracting text from PDF: {e}")
-        raise HTTPException(status_code=500, detail=f"Error extracting text from PDF: {str(e)}")
-
 async def get_embeddings(texts: List[str]) -> List:
     """Get embeddings for a list of texts using OpenAI's API."""
     try:
@@ -225,21 +200,18 @@ def verify_es_document(index_name: str, doc_id: Optional[str] = None):
 
 @app.post("/upload")
 async def upload_pdf(file: UploadFile = File(...), theme_id: str = "default"):
-    """Handle PDF upload, process it, and store in Elasticsearch."""
+    """Handle PDF upload, process it, and store in Elasticsearch without local storage."""
     try:
         if not file.filename.endswith('.pdf'):
             raise HTTPException(status_code=400, detail="File must be a PDF")
 
-        file_path = os.path.join(UPLOAD_DIR, file.filename)
-
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-
-        # Extract text and create chunks
-        pages = extract_text_from_pdf(file_path, file.filename)
+        # Read file directly from memory
+        pdf_content = await file.read()
+        
+        # Extract text without saving to disk
+        pages = extract_text_from_pdf_bytes(pdf_content, file.filename)
         print("\n=== Extracted Pages ===")
         print(f"Number of pages: {len(pages)}")
-
 
         # Get embeddings for each chunk
         page_texts = [page["text"] for page in pages]
@@ -266,32 +238,43 @@ async def upload_pdf(file: UploadFile = File(...), theme_id: str = "default"):
             ]
         }
 
-        # print("\n=== Document to be indexed ===")
-        # print("Document structure:", json.dumps({
-        #     "patent_index": doc["patent_index"],
-        #     "chunks": [{k: v for k, v in chunk.items() if k != 'embedding'} for chunk in doc["chunks"][:1]]  # First chunk only, excluding embedding
-        # }, indent=2))
-
         # Upload to Elasticsearch
         result = es.index(index=theme_id, document=doc)
-        #print(f"\nIndexing result: {result}")
-
-        # Verify the document was indexed correctly
         verify_es_document(theme_id)
 
         return {
             "success": True,
             "filename": file.filename,
             "pages_processed": len(pages),
-            "file_url": f"/pdf/{file.filename}"
         }
 
     except Exception as e:
-        if os.path.exists(file_path):
-            os.remove(file_path)
         print(f"Error processing PDF: {e}")
         print(f"Full traceback: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
+
+def extract_text_from_pdf_bytes(pdf_content: bytes, filename: str) -> List[Dict]:
+    """Extract text from PDF bytes directly without saving to disk."""
+    pages = []
+    try:
+        # Read PDF directly from bytes
+        reader = PdfReader(BytesIO(pdf_content))
+        for page_num in range(len(reader.pages)):
+            text = reader.pages[page_num].extract_text()
+            if text.strip():
+                pages.append({
+                    "pdf_name": filename,
+                    "chunk_index": page_num+1,
+                    "text": text,
+                    "is_claims": False,
+                    "is_abstract": False,
+                    "is_patentability": True,
+                    "is_fto": False
+                })
+        return pages
+    except Exception as e:
+        print(f"Error extracting text from PDF: {e}")
+        raise HTTPException(status_code=500, detail=f"Error extracting text from PDF: {str(e)}")
     
 
 ############################ Chat Response ##################################
@@ -323,8 +306,12 @@ def get_system_message(search_type: str) -> str:
     """
     try:
         base_messages = {
-            "patentability": """You are an AI assistant specializing in patentability analysis. 
-            Focus on identifying relevant prior art and analyzing its implications for patentability.""",
+            "patentability": """
+            1.Act as a highly experienced patent lawyer tasked with assisting a user in conducting patentability. 
+            2.Your role is to accurately interpret the user's queries and provide detailed, precise responses based solely on the provided patent documents. 
+            3.Avoid conjecture or making assumptions; if the necessary information is not available in the provided documents, clearly state that no relevant information can be found.
+            4.Provide a balanced perspective by discussing potential strengths and limitations from the selected information in relation to the query
+            5.If no information can be found via the provided material, just say you cannot find any useful information. Please do not make up information""",
             
             "infringement": """You are an AI assistant specializing in patent infringement analysis. 
             Focus on identifying potential infringement issues and analyzing claim coverage.""",
@@ -336,7 +323,7 @@ def get_system_message(search_type: str) -> str:
             Provide comprehensive analysis of patent content and its implications."""
         }
         
-        return base_messages.get(search_type.lower(), base_messages["general"])
+        return base_messages.get(search_type.lower(), base_messages["patentability"])
     
     except Exception as e:
         logger.error(f"Error in get_system_message: {str(e)}")
@@ -370,14 +357,22 @@ Content by page:"""
     
     # Add analysis instructions
     analysis_instructions = """
+IMPORTANT: Your analysis must following important rules:
 
-Please provide a detailed analysis that:
-1. References specific pages when discussing content
-2. Uses direct quotes with page numbers to support key points
-3. Makes connections between content from different pages when relevant
-4. Uses the format "On page X: [finding/content]" when referencing specific sections
+For answering formatting: 
+1. Reference specific page numbers when quoting or referring to content
+2. Use the format 'On page X: [content/finding]' when discussing specific sections
+3. Provide direct quotes with page references to support key points
+4. Make clear connections between different pages when relevant
+5. Focus on the most relevant sections that address the query
+6. Use markdown formatting for emphasis and structure when appropriate
 
-Focus on how this patent relates to the query, highlighting the most relevant sections with page references.
+For content details:
+1.Act as a highly experienced patent lawyer tasked with assisting a user in conducting patentability. 
+2.Your role is to accurately interpret the user's queries and provide detailed, precise responses based solely on the provided patent documents. 
+3.Avoid conjecture or making assumptions; if the necessary information is not available in the provided documents, clearly state that no relevant information can be found.
+4.Provide a balanced perspective by discussing potential strengths and limitations from the selected information in relation to the query
+5.If no information can be found via the provided material, just say you cannot find any useful information. Please do not make up information
 """
     
     return full_prompt + analysis_instructions
@@ -437,6 +432,7 @@ async def run_analysis_sync(message: str, results: List[dict], search_type: str,
         
         # Format the analyses
         formatted_analyses = []
+
         for analysis, patent_data in zip(analyses, combined_results):
             if analysis:  # Only include successful analyses
                 formatted_analyses.append((analysis, patent_data['chunks']))
@@ -545,13 +541,22 @@ async def analyze_single_patent_async(user_query: str, patent: Dict, search_type
         # Create complete system message
         system_message = f"""{base_system_message}
 
-IMPORTANT: Your analysis must:
+IMPORTANT: Your analysis must following important rules:
+
+For answering formatting: 
 1. Reference specific page numbers when quoting or referring to content
 2. Use the format 'On page X: [content/finding]' when discussing specific sections
 3. Provide direct quotes with page references to support key points
 4. Make clear connections between different pages when relevant
 5. Focus on the most relevant sections that address the query
 6. Use markdown formatting for emphasis and structure when appropriate
+
+For content details:
+1.Act as a highly experienced patent lawyer tasked with assisting a user in conducting patentability. 
+2.Your role is to accurately interpret the user's queries and provide detailed, precise responses based solely on the provided patent documents. 
+3.Avoid conjecture or making assumptions; if the necessary information is not available in the provided documents, clearly state that no relevant information can be found.
+4.Provide a balanced perspective by discussing potential strengths and limitations from the selected information in relation to the query
+5.If no information can be found via the provided material, just say you cannot find any useful information. Please do not make up information
 """
 
         prompt = create_single_patent_prompt(user_query, patent, search_type)
@@ -563,8 +568,8 @@ IMPORTANT: Your analysis must:
                 {"role": "system", "content": system_message},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.5,
-            max_tokens=2000,
+            temperature=0,
+            max_tokens=4000,
             presence_penalty=0.6,
             frequency_penalty=0.3
         )
@@ -688,8 +693,6 @@ async def chat_endpoint(request: ChatRequest):
         logger.error("Traceback: %s", traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
 
-
-
 def selective_patentability_search(es, index_name, user_query, user_embedding, patent_count, selected_pdf=None):
     """
     Enhanced search function that handles both specific PDF and all PDFs cases.
@@ -734,7 +737,7 @@ def selective_patentability_search(es, index_name, user_query, user_embedding, p
             
             logger.info(f"Searching across {len(all_pdfs)} PDFs")
             
-            bm25_results = get_filtered_chunk_details_all(
+            bm25_results = get_chunk_details_all(
                 es=es,
                 index_name=index_name,
                 user_query=user_query,
@@ -742,10 +745,11 @@ def selective_patentability_search(es, index_name, user_query, user_embedding, p
                 is_patentability=True,
                 top_k=patent_count
             )
-            semantic_results = semantic_search(
+            semantic_results = semantic_search_all(
                 es=es,
                 index_name=index_name,
                 query_embedding=user_embedding,
+                all_pdfs=all_pdfs,
                 is_patentability=True,
                 top_k=patent_count
             )
@@ -763,7 +767,349 @@ def selective_patentability_search(es, index_name, user_query, user_embedding, p
         logger.error(traceback.format_exc())
         return []
     
-def get_filtered_chunk_details_all(es, index_name, user_query, all_pdfs, is_patentability=True, top_k=10):
+def semantic_search_all(es, index_name, query_embedding, all_pdfs, is_patentability=True, top_k=10):
+    """
+    Semantic search function that searches within specified PDFs.
+    """
+    logger.info(f"Starting semantic search for {len(all_pdfs)} PDFs")
+    
+    if not query_embedding or len(query_embedding) != 1536:
+        logger.error(f"Invalid query embedding dimensions: expected 1536")
+        return []
+
+    # Nested query for semantic search
+    nested_query = {
+        "bool": {
+            "should": [
+                {
+                    "script_score": {
+                        "query": {"match_all": {}},
+                        "script": {
+                            "source": "cosineSimilarity(params.query_vector, 'chunks.embedding') + 1.0",
+                            "params": {"query_vector": query_embedding}
+                        }
+                    }
+                }
+            ],
+            "minimum_should_match": 1
+        }
+    }
+    
+    # Add patentability filters as should clauses
+    if is_patentability:
+        nested_query["bool"]["should"].extend([
+            {
+                "bool": {
+                    "must_not": [
+                        {"term": {"chunks.is_abstract": True}},
+                        {"term": {"chunks.is_claims": True}}
+                    ],
+                    "should": [
+                        {"term": {"chunks.is_patentability": True}}
+                    ]
+                }
+            }
+        ])
+
+    # Construct query with PDF filter
+    query = {
+        "query": {
+            "bool": {
+                "must": [
+                    {
+                        "terms": {
+                            "patent_index": all_pdfs  # Filter for specific PDFs
+                        }
+                    },
+                    {
+                        "nested": {
+                            "path": "chunks",
+                            "score_mode": "max",
+                            "query": nested_query,
+                            "inner_hits": {
+                                "size": 50,
+                                "_source": True,
+                                "sort": [{"_score": {"order": "desc"}}]
+                            }
+                        }
+                    }
+                ]
+            }
+        },
+        "_source": ["patent_index"],
+        "size": len(all_pdfs)  # Get results for all PDFs
+    }
+
+    try:
+        # Log the query for debugging
+        logger.debug(f"Executing semantic search query: {json.dumps(query, indent=2)}")
+        
+        response = es.search(
+            index=index_name,
+            body=query,
+            request_timeout=30
+        )
+        
+        total_hits = response['hits']['total']['value']
+        logger.info(f"Semantic search found {total_hits} matching documents")
+        
+        results = []
+        seen_chunks = set()
+        min_score_threshold = 1.0
+
+        for hit in response['hits']['hits']:
+            patent_index = hit['_source']['patent_index']
+            inner_hits = hit.get('inner_hits', {}).get('chunks', {}).get('hits', {}).get('hits', [])
+            
+            logger.info(f"Processing document {patent_index} with {len(inner_hits)} matching chunks")
+            
+            for inner_hit in inner_hits:
+                chunk = inner_hit['_source']
+                score = inner_hit['_score']
+                
+                # Debug logging
+                logger.debug(f"Processing chunk from {patent_index} with score {score}")
+                
+                # Skip low-scoring results
+                if score < min_score_threshold:
+                    logger.debug(f"Skipping chunk due to low score: {score}")
+                    continue
+                
+                chunk_index = chunk.get('chunk_index')
+                text = chunk.get('text', '').strip()
+                
+                # Validation
+                if not text or chunk_index is None:
+                    logger.debug(f"Skipping invalid chunk in {patent_index}: empty text or missing index")
+                    continue
+                
+                chunk_key = f"{patent_index}_{chunk_index}"
+                if chunk_key in seen_chunks:
+                    continue
+                
+                seen_chunks.add(chunk_key)
+                
+                # Create result
+                result = {
+                    "patent_id": str(patent_index),
+                    "chunk_index": chunk_index,
+                    "text": text,
+                    "score": score - 1.0,  # Normalize score to [0,1] range
+                    "is_claims": bool(chunk.get('is_claims', False)),
+                    "is_abstract": bool(chunk.get('is_abstract', False)),
+                    "is_patentability": bool(chunk.get('is_patentability', True))
+                }
+                results.append(result)
+                logger.debug(f"Added valid result for chunk {chunk_key} with score {score}")
+        
+        if not results:
+            logger.warning("No valid results found after semantic search")
+            return []
+        
+        # Log result distribution
+        pdf_distribution = {}
+        for result in results:
+            pdf_id = result['patent_id']
+            pdf_distribution[pdf_id] = pdf_distribution.get(pdf_id, 0) + 1
+        
+        logger.info(f"Results distribution across PDFs: {pdf_distribution}")
+        
+        # Sort by score and get top results
+        sorted_results = sorted(results, key=lambda x: x['score'], reverse=True)
+        final_results = sorted_results[:top_k]
+        
+        logger.info(f"Returning {len(final_results)} results from semantic search")
+        return final_results
+
+    except Exception as e:
+        logger.error(f"Error during semantic search: {str(e)}")
+        logger.error(traceback.format_exc())
+        return []
+    
+# def semantic_search_all(es, index_name, query_embedding, is_patentability=True, top_k=10):
+#     """
+#     Optimized semantic search function for searching across all PDFs using cosine similarity.
+#     """
+#     logger.info("Starting semantic search across all PDFs")
+
+#     # Base script score query for cosine similarity
+#     script_score = {
+#         "script": {
+#             "source": "cosineSimilarity(params.query_vector, 'chunks.embedding') + 1.0",
+#             "params": {"query_vector": query_embedding}
+#         }
+#     }
+
+#     # Build filter conditions
+#     filter_conditions = [
+#         {"exists": {"field": "chunks.embedding"}},
+#         {"exists": {"field": "chunks.text"}}
+#     ]
+
+#     if is_patentability:
+#         filter_conditions.extend([
+#             {"term": {"chunks.is_abstract": False}},
+#             {"term": {"chunks.is_patentability": True}},
+#             {"term": {"chunks.is_claims": False}}
+#         ])
+
+#     # Construct optimized query for semantic search
+#     query = {
+#         "query": {
+#             "nested": {
+#                 "path": "chunks",
+#                 "query": {
+#                     "script_score": {
+#                         "query": {
+#                             "bool": {
+#                                 "filter": filter_conditions
+#                             }
+#                         },
+#                         "script": script_score["script"]
+#                     }
+#                 },
+#                 "inner_hits": {
+#                     "size": 50,  # Get more inner hits for better coverage
+#                     "_source": [
+#                         "text",
+#                         "chunk_index",
+#                         "is_abstract",
+#                         "is_claims",
+#                         "is_patentability",
+#                         "embedding"
+#                     ],
+#                     "sort": [{"_score": {"order": "desc"}}]
+#                 }
+#             }
+#         },
+#         "_source": ["patent_index"],
+#         "size": 30,  # Increased size to get more documents
+#         "timeout": "30s",
+#         "sort": [{"_score": {"order": "desc"}}]
+#     }
+
+#     try:
+#         # Execute search with timeout
+#         response = es.search(
+#             index=index_name,
+#             body=query,
+#             request_timeout=30
+#         )
+        
+#         total_hits = response['hits']['total']['value']
+#         logger.info(f"Semantic search found {total_hits} matching documents")
+        
+#         results = []
+#         seen_chunks = set()
+#         min_score_threshold = 0.002  # Minimum similarity score threshold
+        
+#         # Process each document hit
+#         for hit in response['hits']['hits']:
+#             patent_index = hit['_source']['patent_index']
+#             inner_hits = hit.get('inner_hits', {}).get('chunks', {}).get('hits', {}).get('hits', [])
+            
+#             logger.info(f"Processing document {patent_index} with {len(inner_hits)} matching chunks")
+#             chunk_count = 0
+            
+#             # Process chunks within each document
+#             for inner_hit in inner_hits:
+#                 chunk = inner_hit['_source']
+#                 score = inner_hit['_score']
+                
+#                 # Skip low-scoring results
+#                 if score < min_score_threshold:
+#                     continue
+                
+#                 # Basic validation
+#                 if not validate_chunk_content(chunk, patent_index):
+#                     continue
+                
+#                 text = chunk.get('text', '').strip()
+#                 chunk_index = chunk.get('chunk_index', chunk_count)
+#                 chunk_key = f"{patent_index}_{chunk_index}"
+                
+#                 # Skip duplicates
+#                 if chunk_key in seen_chunks:
+#                     logger.debug(f"Skipping duplicate chunk {chunk_key}")
+#                     continue
+                
+#                 seen_chunks.add(chunk_key)
+#                 chunk_count += 1
+                
+#                 # Create standardized result object
+#                 result = {
+#                     "patent_id": str(patent_index),
+#                     "chunk_index": chunk_index,
+#                     "text": text,
+#                     "score": score,
+#                     "is_claims": bool(chunk.get('is_claims', False)),
+#                     "is_abstract": bool(chunk.get('is_abstract', False)),
+#                     "is_patentability": bool(chunk.get('is_patentability', True))
+#                 }
+#                 results.append(result)
+            
+#             if chunk_count > 0:
+#                 logger.info(f"In semantic searc, added {chunk_count} valid chunks from document {patent_index}")
+        
+#         if not results:
+#             logger.warning("No valid results found after semantic search")
+#             return []
+        
+#         # Log result distribution across PDFs
+#         pdf_distribution = {}
+#         for result in results:
+#             pdf_id = result['patent_id']
+#             pdf_distribution[pdf_id] = pdf_distribution.get(pdf_id, 0) + 1
+        
+#         logger.info(f"Results distribution across PDFs: {pdf_distribution}")
+        
+#         # Sort by score and get top results
+#         sorted_results = sorted(results, key=lambda x: x['score'], reverse=True)
+#         final_results = sorted_results[:top_k]
+        
+#         logger.info(f"Returning top {len(final_results)} results from semantic search")
+#         return final_results
+
+#     except Exception as e:
+#         logger.error(f"Error during semantic search: {str(e)}")
+#         logger.error(traceback.format_exc())
+#         return []
+
+def validate_chunk_content(chunk, patent_index):
+    """
+    Enhanced validation of chunk content with detailed logging.
+    """
+    if not chunk:
+        logger.debug(f"Validation failed: Empty chunk object for {patent_index}")
+        return False
+    
+    # Log all available fields for debugging
+    logger.debug(f"Validating chunk fields: {list(chunk.keys())} for {patent_index}")
+    
+    # Check text content
+    text = chunk.get('text', '').strip()
+    if not text:
+        logger.debug(f"Validation failed: Empty text for {patent_index}")
+        return False
+    
+    # Validate chunk index
+    chunk_index = chunk.get('chunk_index')
+    if chunk_index is None:
+        logger.debug(f"Validation failed: Missing chunk_index for {patent_index}")
+        return False
+    
+    # Validate embedding
+    embedding = chunk.get('embedding')
+    if embedding is None:
+        logger.debug(f"Validation failed: Missing embedding for {patent_index}")
+        return False
+    
+    # Additional validation passed
+    logger.debug(f"Chunk validation passed for {patent_index} at index {chunk_index}")
+    return True
+
+    
+def get_chunk_details_all(es, index_name, user_query, all_pdfs, is_patentability=True, top_k=10):
     """
     Enhanced get_chunk_details function that processes all PDFs in the list.
     """
@@ -1272,317 +1618,6 @@ def filtered_semantic_search(es, index_name, query_embedding, selected_pdf, is_p
         logger.error(f"Unexpected error during search: {str(e)}")
         logger.error(traceback.format_exc())
         return []
-
-def get_chunk_details(es, index_name, user_query, is_patentability=True, top_k=10):
-    """
-    Optimized get_chunk_details function for searching across all PDFs with consistent response format.
-    """
-    logger.info(f"Starting get_chunk_details search with query: {user_query[:100]}...")
-
-    try:
-        # Construct an optimized nested query
-        nested_query = {
-            "bool": {
-                "should": [
-                    {
-                        "match": {
-                            "chunks.text": {
-                                "query": user_query,
-                                "operator": "or",
-                                "minimum_should_match": "30%"
-                            }
-                        }
-                    }
-                ],
-                "minimum_should_match": 1,
-                "filter": [
-                    {"exists": {"field": "chunks.text"}}
-                ]
-            }
-        }
-
-        if is_patentability:
-            nested_query["bool"]["filter"].extend([
-                {"term": {"chunks.is_abstract": False}},
-                {"term": {"chunks.is_patentability": True}},
-                {"term": {"chunks.is_claims": False}}
-            ])
-
-        query = {
-            "query": {
-                "nested": {
-                    "path": "chunks",
-                    "query": nested_query,
-                    "inner_hits": {
-                        "size": 50,
-                        "_source": True,
-                        "highlight": {
-                            "fields": {
-                                "chunks.text": {
-                                    "number_of_fragments": 3,
-                                    "fragment_size": 150
-                                }
-                            }
-                        },
-                        "sort": [{"_score": {"order": "desc"}}]
-                    }
-                }
-            },
-            "size": top_k * 2  # Get more results initially for better diversity
-        }
-
-        response = es.search(
-            index=index_name,
-            body=query,
-            request_timeout=30
-        )
-
-        results = []
-        seen_chunks = set()
-
-        for hit in response['hits']['hits']:
-            try:
-                patent_index = hit['_source']['patent_index']
-                inner_hits = hit.get('inner_hits', {}).get('chunks', {}).get('hits', {}).get('hits', [])
-
-                for inner_hit in inner_hits:
-                    chunk = inner_hit['_source']
-                    
-                    # Ensure all required fields are present and valid
-                    if not all(k in chunk for k in ['text', 'chunk_index']):
-                        logger.warning(f"Skipping chunk due to missing required fields in document {patent_index}")
-                        continue
-
-                    chunk_index = chunk['chunk_index']
-                    text = chunk['text'].strip()
-
-                    if not text:
-                        continue
-
-                    chunk_key = f"{patent_index}_{chunk_index}"
-                    if chunk_key in seen_chunks:
-                        continue
-
-                    seen_chunks.add(chunk_key)
-
-                    # Get highlighted text with fallback to original text
-                    highlighted_text = (
-                        inner_hit.get('highlight', {})
-                        .get('chunks.text', [text])[0]
-                    )
-
-                    # Create a standardized result object
-                    result = {
-                        "patent_id": str(patent_index),
-                        "chunk_index": chunk_index,
-                        "text": text,
-                        "highlighted_text": highlighted_text,
-                        "score": float(inner_hit['_score']),  # Ensure score is a float
-                        "is_claims": bool(chunk.get('is_claims', False)),  # Ensure boolean
-                        "is_abstract": bool(chunk.get('is_abstract', False)),
-                        "is_patentability": bool(chunk.get('is_patentability', True))
-                    }
-
-                    results.append(result)
-
-                    if len(results) >= top_k:
-                        break
-
-            except KeyError as ke:
-                logger.error(f"KeyError processing document {patent_index}: {ke}")
-                continue
-            except Exception as e:
-                logger.error(f"Error processing document {patent_index}: {e}")
-                continue
-
-        # Sort results by score and limit to top_k
-        sorted_results = sorted(results, key=lambda x: x['score'], reverse=True)[:top_k]
-        
-        logger.info(f"Returning {len(sorted_results)} results from all PDFs search")
-        return sorted_results
-
-    except Exception as e:
-        logger.error(f"Error during chunk details search: {str(e)}")
-        logger.error(traceback.format_exc())
-        return []
-
-def semantic_search(es, index_name, query_embedding, is_patentability=True, top_k=10):
-    """
-    Optimized semantic search function for searching across all PDFs using cosine similarity.
-    """
-    logger.info("Starting semantic search across all PDFs")
-
-    # Base script score query for cosine similarity
-    script_score = {
-        "script": {
-            "source": "cosineSimilarity(params.query_vector, 'chunks.embedding') + 1.0",
-            "params": {"query_vector": query_embedding}
-        }
-    }
-
-    # Build filter conditions
-    filter_conditions = [
-        {"exists": {"field": "chunks.embedding"}},
-        {"exists": {"field": "chunks.text"}}
-    ]
-
-    if is_patentability:
-        filter_conditions.extend([
-            {"term": {"chunks.is_abstract": False}},
-            {"term": {"chunks.is_patentability": True}},
-            {"term": {"chunks.is_claims": False}}
-        ])
-
-    # Construct optimized query for semantic search
-    query = {
-        "query": {
-            "nested": {
-                "path": "chunks",
-                "query": {
-                    "script_score": {
-                        "query": {
-                            "bool": {
-                                "filter": filter_conditions
-                            }
-                        },
-                        "script": script_score["script"]
-                    }
-                },
-                "inner_hits": {
-                    "size": 50,  # Get more inner hits for better coverage
-                    "_source": [
-                        "text",
-                        "chunk_index",
-                        "is_abstract",
-                        "is_claims",
-                        "is_patentability",
-                        "embedding"
-                    ],
-                    "sort": [{"_score": {"order": "desc"}}]
-                }
-            }
-        },
-        "_source": ["patent_index"],
-        "size": 30,  # Increased size to get more documents
-        "timeout": "30s",
-        "sort": [{"_score": {"order": "desc"}}]
-    }
-
-    try:
-        # Execute search with timeout
-        response = es.search(
-            index=index_name,
-            body=query,
-            request_timeout=30
-        )
-        
-        total_hits = response['hits']['total']['value']
-        logger.info(f"Semantic search found {total_hits} matching documents")
-        
-        results = []
-        seen_chunks = set()
-        min_score_threshold = 0.4  # Minimum similarity score threshold
-        
-        # Process each document hit
-        for hit in response['hits']['hits']:
-            patent_index = hit['_source']['patent_index']
-            inner_hits = hit.get('inner_hits', {}).get('chunks', {}).get('hits', {}).get('hits', [])
-            
-            logger.info(f"Processing document {patent_index} with {len(inner_hits)} matching chunks")
-            chunk_count = 0
-            
-            # Process chunks within each document
-            for inner_hit in inner_hits:
-                chunk = inner_hit['_source']
-                score = inner_hit['_score']
-                
-                # Skip low-scoring results
-                if score < min_score_threshold:
-                    continue
-                
-                # Basic validation
-                if not validate_chunk_content(chunk, patent_index):
-                    continue
-                
-                text = chunk.get('text', '').strip()
-                chunk_index = chunk.get('chunk_index', chunk_count)
-                chunk_key = f"{patent_index}_{chunk_index}"
-                
-                # Skip duplicates
-                if chunk_key in seen_chunks:
-                    logger.debug(f"Skipping duplicate chunk {chunk_key}")
-                    continue
-                
-                seen_chunks.add(chunk_key)
-                chunk_count += 1
-                
-                # Create standardized result object
-                result = {
-                    "patent_id": str(patent_index),
-                    "chunk_index": chunk_index,
-                    "text": text,
-                    "score": score,
-                    "is_claims": bool(chunk.get('is_claims', False)),
-                    "is_abstract": bool(chunk.get('is_abstract', False)),
-                    "is_patentability": bool(chunk.get('is_patentability', True))
-                }
-                results.append(result)
-            
-            if chunk_count > 0:
-                logger.info(f"Added {chunk_count} valid chunks from document {patent_index}")
-        
-        if not results:
-            logger.warning("No valid results found after semantic search")
-            return []
-        
-        # Log result distribution across PDFs
-        pdf_distribution = {}
-        for result in results:
-            pdf_id = result['patent_id']
-            pdf_distribution[pdf_id] = pdf_distribution.get(pdf_id, 0) + 1
-        
-        logger.info(f"Results distribution across PDFs: {pdf_distribution}")
-        
-        # Sort by score and get top results
-        sorted_results = sorted(results, key=lambda x: x['score'], reverse=True)
-        final_results = sorted_results[:top_k]
-        
-        logger.info(f"Returning top {len(final_results)} results from semantic search")
-        return final_results
-
-    except Exception as e:
-        logger.error(f"Error during semantic search: {str(e)}")
-        logger.error(traceback.format_exc())
-        return []
-
-def validate_chunk_content(chunk, patent_index):
-    """
-    Validate chunk content to ensure it meets minimum requirements.
-    """
-    if not chunk:
-        logger.warning(f"Empty chunk in document {patent_index}")
-        return False
-    
-    # Check required fields
-    required_fields = ['text', 'chunk_index']
-    for field in required_fields:
-        if field not in chunk:
-            logger.warning(f"Missing required field '{field}' in chunk from {patent_index}")
-            return False
-    
-    # Validate text content
-    text = chunk.get('text', '').strip()
-    if not text:
-        logger.warning(f"Empty text in chunk from {patent_index}")
-        return False
-    
-    # Validate chunk index
-    chunk_index = chunk.get('chunk_index')
-    if chunk_index is None:
-        logger.warning(f"Invalid chunk index in document {patent_index}")
-        return False
-    
-    return True
 
 def rerank_search_results(bm25_results, semantic_results, alpha=0.3, top_k=None):
     """
