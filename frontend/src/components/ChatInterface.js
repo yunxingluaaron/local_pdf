@@ -18,25 +18,19 @@ import {
   Alert,
   IconButton
 } from '@mui/material';
-import { ChevronLeft, ChevronRight, ZoomIn, ZoomOut } from 'lucide-react';
+import InfoIcon from '@mui/icons-material/Info';
 import axios from 'axios';
 
 const BACKEND_URL = 'http://127.0.0.1:8000';
-const INITIAL_ZOOM = 1;
-const ZOOM_STEP = 0.1;
 const WINDOW_HEIGHT = 'calc(100vh - 200px)';
-
-
 
 const ChatInterfaceComponent = ({ pdfFiles }) => {
   const [messages, setMessages] = useState([]);
   const [newMessage, setNewMessage] = useState('');
   const [loading, setLoading] = useState(false);
-  const [currentPdfUrl, setCurrentPdfUrl] = useState(null);
-  const [selectedPdfFile, setSelectedPdfFile] = useState('');
+  const [selectedPdfFile, setSelectedPdfFile] = useState('all');
   const [error, setError] = useState(null);
-  const [pdfDrawerOpen, setPdfDrawerOpen] = useState(true);
-  const [zoom, setZoom] = useState(INITIAL_ZOOM);
+  const [patentCount, setPatentCount] = useState(5);
   
   const messagesEndRef = useRef(null);
   const chatContainerRef = useRef(null);
@@ -49,22 +43,15 @@ const ChatInterfaceComponent = ({ pdfFiles }) => {
     scrollToBottom();
   }, [messages]);
 
-  const handlePdfSelect = async (event) => {
-    setLoading(true);
-    try {
-      const selectedUrl = event.target.value;
-      if (selectedUrl && !pdfFiles.some(pdf => pdf.url === selectedUrl)) {
-        throw new Error('Invalid PDF selection');
-      }
-      setSelectedPdfFile(selectedUrl);
-      setCurrentPdfUrl(selectedUrl);
-      setError(null);
-    } catch (err) {
-      setError('Error selecting PDF file');
-      console.error('PDF selection error:', err);
-    } finally {
-      setLoading(false);
-    }
+  const handlePdfSelect = (event) => {
+    const selectedValue = event.target.value;
+    setSelectedPdfFile(selectedValue);
+    setError(null);
+  };
+
+  const handlePatentCountChange = (event) => {
+    const value = parseInt(event.target.value, 10);
+    setPatentCount(value);
   };
 
   const handleKeyPress = (event) => {
@@ -89,42 +76,131 @@ const ChatInterfaceComponent = ({ pdfFiles }) => {
     setError(null);
 
     try {
-      const response = await axios.post(`${BACKEND_URL}/chat`, {
-        message: newMessage,
-        theme_id: "default"
-      });
+      const pdfSelection = selectedPdfFile === 'all' 
+        ? 'all'
+        : selectedPdfFile;
 
-      if (!response.data || !response.data.response) {
-        throw new Error('Invalid response from server');
+      const requestPayload = {
+        message: newMessage,
+        selected_pdf: pdfSelection,
+        theme_id: "default",
+        patent_count: parseInt(patentCount, 10),
+        mode: "default",
+        search_type: "quick"
+      };
+
+      const response = await axios.post(`${BACKEND_URL}/chat`, requestPayload);
+      
+      if (!response.data) {
+        throw new Error('Empty response from server');
       }
 
+      if (response.data.error) {
+        throw new Error(response.data.error);
+      }
+
+      // Handle the response text, ensuring it's a string
+      const responseText = typeof response.data.response === 'string' 
+        ? response.data.response 
+        : JSON.stringify(response.data.response);
+
+      // Process sources array if it exists
+      const sources = Array.isArray(response.data.sources) 
+        ? response.data.sources 
+        : [];
+
       const botMessage = {
-        text: response.data.response,
+        text: responseText,
         sender: 'bot',
         timestamp: new Date().toISOString(),
-        sources: response.data.sources || []
+        sources: sources.map(source => ({
+          ...source,
+          patent_id: String(source.patent_id),
+          chunk_index: Number(source.chunk_index),
+          final_score: Number(source.final_score || source.score || 0)
+        }))
       };
 
       setMessages(prev => [...prev, botMessage]);
+      
     } catch (error) {
       console.error('Error sending message:', error);
-      const errorMessage = typeof error === 'object' ? 
-        (error.response?.data?.detail || error.message || 'An error occurred') : 
-        String(error);
       
-      setError(errorMessage);
+      let errorMessage = 'An unknown error occurred';
+      
+      if (error.response?.status === 422) {
+        const validationErrors = error.response.data;
+        if (Array.isArray(validationErrors)) {
+          errorMessage = validationErrors
+            .map(err => err.msg)
+            .join('\n');
+        } else if (typeof validationErrors === 'object') {
+          errorMessage = validationErrors.detail || validationErrors.msg || JSON.stringify(validationErrors);
+        }
+      } else if (error.response?.data) {
+        const errorData = error.response.data;
+        if (typeof errorData === 'string') {
+          errorMessage = errorData;
+        } else if (typeof errorData === 'object') {
+          if (errorData.msg) {
+            errorMessage = typeof errorData.msg === 'string' ? errorData.msg : JSON.stringify(errorData.msg);
+          } else if (errorData.detail) {
+            errorMessage = typeof errorData.detail === 'string' ? errorData.detail : JSON.stringify(errorData.detail);
+          } else if (errorData.error) {
+            errorMessage = typeof errorData.error === 'string' ? errorData.error : JSON.stringify(errorData.error);
+          }
+        }
+      } else if (error.message) {
+        errorMessage = error.message;
+      }
+      
       setMessages(prev => [...prev, {
         text: errorMessage,
         sender: 'bot',
         timestamp: new Date().toISOString(),
         error: true
       }]);
+      
+      setError(errorMessage);
     } finally {
       setLoading(false);
     }
   };
 
+  const getMessageContent = (message) => {
+    if (!message) return '';
+    
+    let content = message.text;
+  
+    if (typeof content === 'string') {
+      return content;
+    }
+  
+    if (content && typeof content === 'object') {
+      if (content.msg) {
+        return typeof content.msg === 'string' ? content.msg : JSON.stringify(content.msg, null, 2);
+      }
+      if (content.detail) {
+        return typeof content.detail === 'string' ? content.detail : JSON.stringify(content.detail, null, 2);
+      }
+      if (content.type && content.loc && content.msg) {
+        const errorMsg = typeof content.msg === 'string' ? content.msg : JSON.stringify(content.msg, null, 2);
+        return `Error: ${errorMsg}`;
+      }
+  
+      try {
+        return JSON.stringify(content, null, 2);
+      } catch {
+        return 'Unable to display message content';
+      }
+    }
+  
+    return content?.toString() || '';
+  };
+
   const renderMessage = (message) => {
+    const messageContent = getMessageContent(message);
+
     return (
       <Paper
         sx={{
@@ -132,69 +208,94 @@ const ChatInterfaceComponent = ({ pdfFiles }) => {
           maxWidth: '70%',
           backgroundColor: message.error ? '#ffebee' : 
                           message.sender === 'user' ? '#e3f2fd' : '#f5f5f5',
+          wordBreak: 'break-word'
         }}
       >
-        <Box 
-          sx={{
-            '& .markdown': {
-              '& pre': {
-                backgroundColor: '#f5f5f5',
-                padding: '8px',
-                borderRadius: '4px',
-                overflowX: 'auto',
+        <Box>
+          {message.error ? (
+            <Alert severity="error" sx={{ mb: 1 }}>
+              {messageContent}
+            </Alert>
+          ) : (
+            <Box sx={{
+              '& .markdown': {
+                '& pre': {
+                  backgroundColor: '#f8f9fa',
+                  padding: '16px',
+                  borderRadius: '4px',
+                  overflow: 'auto',
+                  '& code': {
+                    backgroundColor: 'transparent',
+                    padding: 0
+                  }
+                },
                 '& code': {
-                  backgroundColor: 'transparent',
-                  padding: 0
-                }
-              },
-              '& code': {
-                backgroundColor: '#f5f5f5',
-                padding: '2px 4px',
-                borderRadius: '4px',
-                fontSize: '0.875em',
-                fontFamily: 'monospace'
-              },
-              '& p': {
-                marginTop: '8px',
-                marginBottom: '8px',
-                '&:first-of-type': {
-                  marginTop: 0
+                  backgroundColor: '#f8f9fa',
+                  padding: '2px 4px',
+                  borderRadius: '4px',
+                  fontSize: '0.875em'
                 },
-                '&:last-child': {
-                  marginBottom: 0
-                }
-              },
-              '& ul, & ol': {
-                paddingLeft: '20px',
-                marginTop: '8px',
-                marginBottom: '8px'
-              },
-              '& blockquote': {
-                borderLeft: '4px solid #ddd',
-                margin: '16px 0',
-                padding: '0 16px',
-                color: '#666'
-              },
-              '& table': {
-                borderCollapse: 'collapse',
-                width: '100%',
-                marginTop: '8px',
-                marginBottom: '8px',
-                '& th, & td': {
-                  border: '1px solid #ddd',
-                  padding: '8px',
-                  textAlign: 'left'
+                '& p': {
+                  marginTop: '8px',
+                  marginBottom: '8px',
+                  lineHeight: 1.6,
+                  '&:first-of-type': {
+                    marginTop: 0
+                  },
+                  '&:last-child': {
+                    marginBottom: 0
+                  }
                 },
-                '& th': {
-                  backgroundColor: '#f5f5f5'
+                '& ul, & ol': {
+                  paddingLeft: '24px',
+                  marginTop: '8px',
+                  marginBottom: '8px'
+                },
+                '& li': {
+                  marginBottom: '4px'
+                },
+                '& blockquote': {
+                  borderLeft: '4px solid #e0e0e0',
+                  margin: '16px 0',
+                  padding: '8px 16px',
+                  color: '#666'
+                },
+                '& h1, & h2, & h3, & h4, & h5, & h6': {
+                  margin: '16px 0 8px 0',
+                  lineHeight: 1.4,
+                  fontWeight: 600
+                },
+                '& h1': { fontSize: '1.5em' },
+                '& h2': { fontSize: '1.3em' },
+                '& h3': { fontSize: '1.2em' },
+                '& a': {
+                  color: '#2196f3',
+                  textDecoration: 'none',
+                  '&:hover': {
+                    textDecoration: 'underline'
+                  }
+                },
+                '& table': {
+                  borderCollapse: 'collapse',
+                  width: '100%',
+                  margin: '16px 0',
+                  '& th, & td': {
+                    border: '1px solid #e0e0e0',
+                    padding: '8px 12px',
+                    textAlign: 'left'
+                  },
+                  '& th': {
+                    backgroundColor: '#f8f9fa',
+                    fontWeight: 600
+                  }
                 }
               }
-            }
-          }}
-        >
-          <ReactMarkdown className="markdown">
-            {String(message.text)}
-          </ReactMarkdown>
+            }}>
+              <ReactMarkdown className="markdown">
+                {messageContent}
+              </ReactMarkdown>
+            </Box>
+          )}
         </Box>
         
         {message.sender === 'bot' && message.sources && message.sources.length > 0 && (
@@ -212,19 +313,6 @@ const ChatInterfaceComponent = ({ pdfFiles }) => {
                     size="small"
                     color="primary"
                     variant="outlined"
-                    onClick={() => {
-                      const pdfFile = pdfFiles.find(pdf => 
-                        pdf.name === source.patent_id || 
-                        pdf.name === fileName
-                      );
-                      if (pdfFile) {
-                        setSelectedPdfFile(pdfFile.url);
-                        setCurrentPdfUrl(pdfFile.url);
-                      } else {
-                        setError(`Could not find PDF file: ${fileName}`);
-                      }
-                    }}
-                    disabled={loading}
                     sx={{ cursor: 'pointer' }}
                   />
                 </Tooltip>
@@ -236,19 +324,6 @@ const ChatInterfaceComponent = ({ pdfFiles }) => {
     );
   };
 
-  const handleZoomIn = () => {
-    setZoom(prev => Math.min(prev + ZOOM_STEP, 2));
-  };
-
-  const handleZoomOut = () => {
-    setZoom(prev => Math.max(prev - ZOOM_STEP, 0.5));
-  };
-
-  const togglePdfDrawer = () => {
-    setPdfDrawerOpen(prev => !prev);
-  };
-
-  // ... Rest of the JSX remains the same ...
   return (
     <Box sx={{ 
       display: 'flex', 
@@ -264,9 +339,14 @@ const ChatInterfaceComponent = ({ pdfFiles }) => {
         </Alert>
       )}
 
-      {/* PDF Select Control */}
-      <Box sx={{ width: '100%', flexShrink: 0 }}>
-        <FormControl fullWidth>
+      <Box sx={{ 
+        display: 'flex', 
+        gap: 2, 
+        width: '100%', 
+        flexShrink: 0,
+        alignItems: 'center'
+      }}>
+        <FormControl sx={{ flex: 1 }}>
           <InputLabel id="pdf-select-label">Select PDF Document</InputLabel>
           <Select
             labelId="pdf-select-label"
@@ -275,169 +355,59 @@ const ChatInterfaceComponent = ({ pdfFiles }) => {
             label="Select PDF Document"
             sx={{ backgroundColor: 'background.paper' }}
           >
-            <MenuItem value="">
-              <em>None</em>
-            </MenuItem>
+            <MenuItem value="all">All PDFs</MenuItem>
             {pdfFiles?.map((pdf, index) => (
-              <MenuItem key={index} value={pdf.url}>
+              <MenuItem key={index} value={pdf.name}>
                 {pdf.name}
               </MenuItem>
             ))}
           </Select>
         </FormControl>
+
+        <FormControl sx={{ width: 200 }}>
+          <InputLabel id="patent-count-label">Number of Patents</InputLabel>
+          <Select
+            labelId="patent-count-label"
+            value={patentCount}
+            onChange={handlePatentCountChange}
+            label="Number of Patents"
+            sx={{ backgroundColor: 'background.paper' }}
+          >
+            {[...Array(10)].map((_, i) => (
+              <MenuItem key={i + 1} value={i + 1}>
+                {i + 1} Patent{i !== 0 ? 's' : ''}
+              </MenuItem>
+            ))}
+          </Select>
+        </FormControl>
+
+        <Tooltip title="Select 'All PDFs' to search across all documents, or choose a specific PDF to focus your search.">
+          <IconButton size="small" color="primary">
+            <InfoIcon />
+          </IconButton>
+        </Tooltip>
       </Box>
 
-      {/* Main Content Area - 50/50 Split */}
       <Box sx={{ 
         display: 'flex', 
-        gap: 2,
-        position: 'relative',
+        flexDirection: 'column',
         height: WINDOW_HEIGHT,
-        flexShrink: 0
+        width: '100%'
       }}>
-        {/* Chat Section - Fixed 50% */}
-        <Box sx={{ 
-          width: '50%',
-          display: 'flex', 
-          flexDirection: 'column',
-          height: '100%',
-          minWidth: 0 // Allow flex shrinking
-        }}>
-          {/* Messages Container */}
-          <Paper 
-            ref={chatContainerRef}
-            sx={{ 
-              flex: 1,
-              mb: 2, 
-              display: 'flex',
-              flexDirection: 'column',
-              overflow: 'hidden',
-              '& > .scroll-container': {
-                flex: 1,
-                overflowY: 'auto',
-                overflowX: 'hidden',
-                '&::-webkit-scrollbar': {
-                  width: '8px',
-                },
-                '&::-webkit-scrollbar-track': {
-                  background: '#f1f1f1',
-                  borderRadius: '4px',
-                },
-                '&::-webkit-scrollbar-thumb': {
-                  background: '#888',
-                  borderRadius: '4px',
-                },
-                '&::-webkit-scrollbar-thumb:hover': {
-                  background: '#555',
-                },
-              }
-            }}
-          >
-            <Box className="scroll-container" sx={{ p: 2 }}>
-              <List>
-                {messages.map((message, index) => (
-                  <ListItem
-                    key={index}
-                    sx={{
-                      justifyContent: message.sender === 'user' ? 'flex-end' : 'flex-start',
-                      mb: 1,
-                      px: 1
-                    }}
-                  >
-                    {renderMessage(message)}
-                  </ListItem>
-                ))}
-                <div ref={messagesEndRef} />
-              </List>
-            </Box>
-          </Paper>
-
-          {/* Input Area */}
-          <Box sx={{ 
-            display: 'flex', 
-            gap: 1,
-            flexShrink: 0
-          }}>
-            <TextField
-              fullWidth
-              variant="outlined"
-              value={newMessage}
-              onChange={(e) => setNewMessage(e.target.value)}
-              onKeyPress={handleKeyPress}
-              placeholder="Type your message..."
-              disabled={loading}
-              multiline
-              maxRows={4}
-              sx={{
-                backgroundColor: 'background.paper',
-                '& .MuiOutlinedInput-root': {
-                  borderRadius: 2
-                }
-              }}
-            />
-            <Button 
-              variant="contained"
-              onClick={handleSendMessage}
-              disabled={loading || !newMessage.trim()}
-              sx={{ 
-                minWidth: '100px',
-                borderRadius: 2
-              }}
-            >
-              {loading ? <CircularProgress size={24} /> : 'Send'}
-            </Button>
-          </Box>
-        </Box>
-
-        {/* PDF Viewer Section - Fixed 50% */}
-        <Paper sx={{ 
-          width: '50%',
-          height: '100%',
-          overflow: 'hidden',
-          borderRadius: 2,
-          position: 'relative',
-          display: 'flex',
-          flexDirection: 'column',
-          backgroundColor: 'background.paper'
-        }}>
-          {/* PDF Controls */}
-          <Box sx={{
-            position: 'absolute',
-            top: 8,
-            right: 8,
-            zIndex: 2,
-            bgcolor: 'background.paper',
-            borderRadius: 1,
-            boxShadow: 1,
+        <Paper 
+          ref={chatContainerRef}
+          sx={{ 
+            flex: 1,
+            mb: 2, 
             display: 'flex',
-            gap: 1,
-            p: 1
-          }}>
-            <IconButton onClick={handleZoomOut} size="small">
-              <ZoomOut />
-            </IconButton>
-            <IconButton onClick={handleZoomIn} size="small">
-              <ZoomIn />
-            </IconButton>
-          </Box>
-
-          {/* PDF Content */}
-          {loading ? (
-            <Box sx={{ 
-              display: 'flex', 
-              justifyContent: 'center', 
-              alignItems: 'center', 
-              flex: 1
-            }}>
-              <CircularProgress />
-            </Box>
-          ) : currentPdfUrl ? (
-            <Box sx={{
+            flexDirection: 'column',
+            overflow: 'hidden',
+            '& > .scroll-container': {
               flex: 1,
-              overflow: 'auto',
+              overflowY: 'auto',
+              overflowX: 'hidden',
               '&::-webkit-scrollbar': {
                 width: '8px',
-                height: '8px'
               },
               '&::-webkit-scrollbar-track': {
                 background: '#f1f1f1',
@@ -450,38 +420,67 @@ const ChatInterfaceComponent = ({ pdfFiles }) => {
               '&::-webkit-scrollbar-thumb:hover': {
                 background: '#555',
               },
-            }}>
-              <iframe
-                src={`${currentPdfUrl}#zoom=${zoom}`}
-                style={{
-                  width: '100%',
-                  height: '100%',
-                  border: 'none',
-                  transform: `scale(${zoom})`,
-                  transformOrigin: 'top left',
-                  transition: 'transform 0.2s ease'
-                }}
-                title="PDF Viewer"
-                onLoad={() => setLoading(false)}
-              />
-            </Box>
-          ) : (
-            <Box sx={{ 
-              display: 'flex', 
-              justifyContent: 'center', 
-              alignItems: 'center', 
-              flex: 1
-            }}>
-              <Typography color="text.secondary">
-                Select a PDF document to view its content
-              </Typography>
-            </Box>
-          )}
+            }
+          }}
+        >
+          <Box className="scroll-container" sx={{ p: 2 }}>
+            <List>
+              {messages.map((message, index) => (
+                <ListItem
+                  key={index}
+                  sx={{
+                    justifyContent: message.sender === 'user' ? 'flex-end' : 'flex-start',
+                    mb: 1,
+                    px: 1
+                  }}
+                >
+                  {renderMessage(message)}
+                </ListItem>
+              ))}
+              <div ref={messagesEndRef} />
+            </List>
+          </Box>
         </Paper>
-      </Box>
-    </Box>
-  );
+
+        <Box sx={{ 
+          display: 'flex', 
+          gap: 1,
+          flexShrink: 0
+        }}>
+          <TextField
+            fullWidth
+            variant="outlined"
+            value={newMessage}
+            onChange={(e) => setNewMessage(e.target.value)}
+            onKeyPress={handleKeyPress}
+            placeholder="Type your message..."
+            disabled={loading}
+            multiline
+            maxRows={4}
+            sx={{
+              backgroundColor: 'background.paper',
+              '& .MuiOutlinedInput-root': {
+                borderRadius: 2
+              }
+            }}
+          />
+          <Button 
+            variant="contained"
+            onClick={handleSendMessage}
+            disabled={loading || !newMessage.trim()}
+            sx={{ 
+              minWidth: '100px',
+              borderRadius: 2
+            }}
+          >
+
+
+{loading ? <CircularProgress size={24} /> : 'Send'}
+</Button>
+</Box>
+</Box>
+</Box>
+);
 };
 
 export default ChatInterfaceComponent;
-

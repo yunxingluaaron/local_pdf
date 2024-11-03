@@ -16,6 +16,8 @@ import { Delete as DeleteIcon, CheckCircle as CheckCircleIcon } from '@mui/icons
 import axios from 'axios';
 
 const BACKEND_URL = 'http://127.0.0.1:8000';
+const MAX_FILE_SIZE = 3 * 1024 * 1024; // 3MB in bytes
+const MAX_FILES = 3;
 
 const PDFUploadComponent = ({ onUploadComplete }) => {
   const [selectedFiles, setSelectedFiles] = useState([]);
@@ -26,20 +28,37 @@ const PDFUploadComponent = ({ onUploadComplete }) => {
 
   const handleFileSelect = (event) => {
     const files = Array.from(event.target.files);
+    const errors = [];
+    
+    // Check if adding new files would exceed the maximum count
+    if (files.length + selectedFiles.length > MAX_FILES) {
+      setError(`Maximum ${MAX_FILES} PDFs allowed`);
+      return;
+    }
+
     const validFiles = files.filter(file => {
-      if (file.size > 10 * 1024 * 1024) {
-        setError(`${file.name} is larger than 10MB`);
+      // Check file size
+      if (file.size > MAX_FILE_SIZE) {
+        errors.push(`${file.name} is larger than 3MB`);
         return false;
       }
+      // Check file type
       if (!file.type.includes('pdf')) {
-        setError(`${file.name} is not a PDF file`);
+        errors.push(`${file.name} is not a PDF file`);
         return false;
       }
       return true;
     });
 
-    if (validFiles.length + selectedFiles.length > 5) {
-      setError('Maximum 5 PDFs allowed');
+    // If there are any errors, show them all
+    if (errors.length > 0) {
+      setError(errors.join('. '));
+      return;
+    }
+
+    // Check if total files would exceed limit
+    if (validFiles.length + selectedFiles.length > MAX_FILES) {
+      setError(`Cannot add more files. Maximum ${MAX_FILES} PDFs allowed`);
       return;
     }
 
@@ -52,65 +71,63 @@ const PDFUploadComponent = ({ onUploadComplete }) => {
     setError(null);
   };
 
-// PDFUploadComponent.js
+  const handleUpload = async () => {
+    setUploading(true);
+    setError(null);
+    const uploadedFiles = [];
 
-    const handleUpload = async () => {
-        setUploading(true);
-        setError(null);
-        const uploadedFiles = [];
+    try {
+      for (let i = 0; i < selectedFiles.length; i++) {
+        const file = selectedFiles[i];
+        const formData = new FormData();
+        formData.append('file', file);
+        formData.append('theme_id', 'default');
 
-        try {
-            for (let i = 0; i < selectedFiles.length; i++) {
-                const file = selectedFiles[i];
-                const formData = new FormData();
-                formData.append('file', file);
-                formData.append('theme_id', 'default');  // Add theme_id parameter
+        setUploadProgress(prev => ({
+          ...prev,
+          [file.name]: 0
+        }));
 
-                setUploadProgress(prev => ({
-                    ...prev,
-                    [file.name]: 0
-                }));
+        const response = await axios.post(`${BACKEND_URL}/upload`, formData, {
+          headers: {
+            'Content-Type': 'multipart/form-data'
+          },
+          onUploadProgress: (progressEvent) => {
+            const progress = Math.round((progressEvent.loaded * 100) / progressEvent.total);
+            setUploadProgress(prev => ({
+              ...prev,
+              [file.name]: progress
+            }));
+          }
+        });
 
-                const response = await axios.post(`${BACKEND_URL}/upload`, formData, {
-                    headers: {
-                        'Content-Type': 'multipart/form-data'
-                    },
-                    onUploadProgress: (progressEvent) => {
-                        const progress = Math.round((progressEvent.loaded * 100) / progressEvent.total);
-                        setUploadProgress(prev => ({
-                            ...prev,
-                            [file.name]: progress
-                        }));
-                    }
-                });
-
-                if (response.data.success) {
-                    uploadedFiles.push({
-                        name: file.name,
-                        url: `${BACKEND_URL}${response.data.file_url}`,
-                        pages: response.data.pages_processed
-                    });
-                    
-                    setProcessedFiles(prev => [...prev, {
-                        name: file.name,
-                        pages: response.data.pages_processed
-                    }]);
-                }
-            }
-
-            onUploadComplete(uploadedFiles);
-            setSelectedFiles([]);
-            setUploadProgress({});
-        } catch (err) {
-            console.error('Upload error:', err);
-            const errorMessage = typeof err === 'object' ? 
-                (err.response?.data?.detail || err.message || 'Upload failed') : 
-                String(err);
-            setError(errorMessage);
-        } finally {
-            setUploading(false);
+        if (response.data.success) {
+          uploadedFiles.push({
+            name: file.name,
+            url: `${BACKEND_URL}${response.data.file_url}`,
+            pages: response.data.pages_processed
+          });
+          
+          setProcessedFiles(prev => [...prev, {
+            name: file.name,
+            pages: response.data.pages_processed
+          }]);
         }
-    };
+      }
+
+      onUploadComplete(uploadedFiles);
+      setSelectedFiles([]);
+      setUploadProgress({});
+    } catch (err) {
+      console.error('Upload error:', err);
+      const errorMessage = typeof err === 'object' ? 
+        (err.response?.data?.detail || err.message || 'Upload failed') : 
+        String(err);
+      setError(errorMessage);
+    } finally {
+      setUploading(false);
+    }
+  };
 
   return (
     <Paper sx={{ p: 3, maxWidth: 800, margin: 'auto', mt: 3 }}>
@@ -120,13 +137,13 @@ const PDFUploadComponent = ({ onUploadComplete }) => {
       
       <Box sx={{ mb: 3 }}>
         <Typography variant="body2" color="text.secondary" gutterBottom>
-          Upload up to 5 PDF files (max 10MB each)
+          Upload up to {MAX_FILES} PDF files (max 3MB each)
         </Typography>
         
         <Button
           variant="contained"
           component="label"
-          disabled={uploading}
+          disabled={uploading || selectedFiles.length >= MAX_FILES}
           sx={{ mr: 2 }}
         >
           Select PDFs
@@ -162,7 +179,7 @@ const PDFUploadComponent = ({ onUploadComplete }) => {
       {selectedFiles.length > 0 && (
         <Box sx={{ mb: 3 }}>
           <Typography variant="subtitle1" gutterBottom>
-            Selected Files:
+            Selected Files: ({selectedFiles.length}/{MAX_FILES})
           </Typography>
           <List>
             {selectedFiles.map((file, index) => (
